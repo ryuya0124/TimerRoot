@@ -597,10 +597,17 @@ public class MainActivity extends Activity {
     private void confirmKsu() {
         new AlertDialog.Builder(this)
                 .setTitle("Load KernelSU?")
-                .setMessage("Runs the fake-credential exploit to get root with SELinux off, "
-                        + "then loads ksud.\n\n"
-                        + "- On success su works in u:r:ksu:s0\n"
-                        + "- The parent process parks; reboot to clean up\n"
+                .setMessage("Runs the fake-credential exploit chain:\n\n"
+                        + "1. KASLR slide probe (mode=0)\n"
+                        + "2. panic_on_warn zeroed (mode=0)\n"
+                        + "3. Fake cred with all caps (mode=2)\n"
+                        + "4. SELinux off (mode=0)\n"
+                        + "5. uid/gid fixed in fake cred\n"
+                        + "6. ksud late-load via KernelSU Manager\n\n"
+                        + "- Single process handles all steps\n"
+                        + "- Process stays alive to hold fake cred\n"
+                        + "- On success: su in u:r:ksu:s0\n"
+                        + "- Reboot to clean up\n"
                         + "- Do not use the device while it runs")
                 .setPositiveButton("Run", (d, w) -> runKsu())
                 .setNegativeButton("Cancel", null)
@@ -614,56 +621,68 @@ public class MainActivity extends Activity {
         }
         new Thread(() -> {
             try {
-                /* Run timer fake in background — it handles everything:
-                 * fake cred, SELinux disable, panic_on_warn zero,
-                 * uid/euid/suid/sgid/gid/egid zero, then loads ksud */
+                /* `timer fake` runs the full chain internally:
+                 *   slide_probe → panic_on_warn → fake_cred(mode=2) →
+                 *   selinux → uid/gid fixes → child wake → ksu_stage.sh
+                 * The parent calls hold_forever() to keep fake cred pages
+                 * alive, so it never exits — must run detached. */
                 addLog("starting fake-credential exploit...");
-                addLog(service.runDetached("fake"));
+                String initial = service.runDetached("fake");
+                addLog(initial);
+
                 final long start = System.currentTimeMillis();
                 boolean loaded = false;
                 String failure = null;
-                while (System.currentTimeMillis() - start < 120000) {
+                String prevLog = "";
+
+                while (System.currentTimeMillis() - start < 120_000) {
                     Thread.sleep(2000);
-                    String tail = service.readLog();
-                    if (tail.contains("KSU_LOADED")) {
+                    String log = service.readLog();
+                    if (!log.equals(prevLog)) {
+                        String delta = log.substring(
+                                Math.min(prevLog.length(), log.length()));
+                        if (!delta.isEmpty()) {
+                            addLog(delta.trim());
+                        }
+                        prevLog = log;
+                    }
+                    if (log.contains("KSU_LOADED")) {
                         loaded = true;
                         break;
                     }
-                    if (tail.contains("parking without reap")
-                            || tail.contains("park_forever")) {
-                        failure = "exploit parked — check log";
+                    if (log.contains("parking")) {
+                        failure = "exploit parked — reboot and retry";
                         break;
                     }
-                    if (tail.contains("fake cred layout not supported")) {
+                    if (log.contains("layout not supported")) {
                         failure = "cred layout not supported on this kernel";
                         break;
                     }
-                    final long secs = (System.currentTimeMillis() - start) / 1000;
-                    if (secs % 10 == 0) {
-                        final long s = secs;
-                        ui.post(() -> {
-                            if (statusSubtitle != null)
-                                statusSubtitle.setText("Loading KernelSU... " + s + "s");
-                        });
+                    if (log.contains("ksud missing")) {
+                        failure = "ksud not found — install KernelSU Manager";
+                        break;
+                    }
+                    if (log.contains("KSU_MISSING")) {
+                        failure = "ksud ran but kernel module did not load";
+                        break;
                     }
                 }
-                if (!loaded && failure == null)
-                    failure = "timed out after 120s";
+                if (!loaded && failure == null) {
+                    failure = "timed out after 120s — check log tab";
+                }
 
                 final boolean ok = loaded;
                 final String reason = failure;
                 ui.post(() -> {
-                    applyDetails();
                     if (ok) {
-                        toast("KernelSU loaded (jailbreak mode)");
+                        toast("KernelSU loaded");
                         refreshDetails();
                     } else {
                         statusTitle.setText("KernelSU failed");
-                        statusSubtitle.setText(reason + " - reboot, then retry");
+                        statusSubtitle.setText(reason);
                         statusBadge.setText("!");
                         statusBadge.setTextColor(RED);
                         toast("KernelSU failed: " + reason);
-                        addLog("KernelSU failed: " + reason);
                     }
                 });
             } catch (Throwable t) {
