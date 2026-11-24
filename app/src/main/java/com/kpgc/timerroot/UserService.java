@@ -149,9 +149,15 @@ public class UserService extends IUserService.Stub {
             Thread.sleep(6000);
             String out = new String();
             long deadline = System.currentTimeMillis() + 20000;
+            boolean sentId = false;
             while (System.currentTimeMillis() < deadline) {
-                String line = rootLines.poll(100, TimeUnit.MILLISECONDS);
+                String line = rootLines.poll(200, TimeUnit.MILLISECONDS);
                 if (line == null) {
+                    if (!sentId && rootProcess.isAlive()) {
+                        rootInput.write("id\n");
+                        rootInput.flush();
+                        sentId = true;
+                    }
                     continue;
                 }
                 out += line + "\n";

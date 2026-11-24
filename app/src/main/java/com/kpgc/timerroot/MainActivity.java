@@ -580,11 +580,13 @@ public class MainActivity extends Activity {
         new Thread(() -> {
             try {
                 String out = service.openRoot();
-                rootOpen = out.contains("uid=0(root)") || out.contains("started");
+                rootOpen = out.contains("uid=0(root)");
                 addLog(out);
                 ui.post(this::applyDetails);
                 if (rootOpen) {
                     addLog("root shell ready");
+                } else {
+                    addLog("root shell failed");
                 }
             } catch (Throwable t) {
                 addLog("root failed: " + t);
@@ -595,9 +597,10 @@ public class MainActivity extends Activity {
     private void confirmKsu() {
         new AlertDialog.Builder(this)
                 .setTitle("Load KernelSU?")
-                .setMessage("Opens root shell (with SELinux disabled) and runs ksud.\n\n"
+                .setMessage("Runs the fake-credential exploit to get root with SELinux off, "
+                        + "then loads ksud.\n\n"
                         + "- On success su works in u:r:ksu:s0\n"
-                        + "- Reboot to clean up\n"
+                        + "- The parent process parks; reboot to clean up\n"
                         + "- Do not use the device while it runs")
                 .setPositiveButton("Run", (d, w) -> runKsu())
                 .setNegativeButton("Cancel", null)
@@ -611,67 +614,44 @@ public class MainActivity extends Activity {
         }
         new Thread(() -> {
             try {
-                /* Step 1: get root shell (timer shell now also disables
-                 * panic_on_warn and SELinux in the same exploit run) */
-                if (!rootOpen) {
-                    addLog("opening root shell (includes SELinux disable)...");
-                    String out = service.openRoot();
-                    rootOpen = out.contains("uid=0(root)") || out.contains("started");
-                    addLog(out);
-                    ui.post(this::applyDetails);
-                    if (!rootOpen) {
-                        addLog("failed to get root - cannot proceed");
-                        return;
+                /* Run timer fake in background — it handles everything:
+                 * fake cred, SELinux disable, panic_on_warn zero,
+                 * uid/euid/suid/sgid/gid/egid zero, then loads ksud */
+                addLog("starting fake-credential exploit...");
+                addLog(service.runDetached("fake"));
+                final long start = System.currentTimeMillis();
+                boolean loaded = false;
+                String failure = null;
+                while (System.currentTimeMillis() - start < 120000) {
+                    Thread.sleep(2000);
+                    String tail = service.readLog();
+                    if (tail.contains("KSU_LOADED")) {
+                        loaded = true;
+                        break;
+                    }
+                    if (tail.contains("parking without reap")
+                            || tail.contains("park_forever")) {
+                        failure = "exploit parked — check log";
+                        break;
+                    }
+                    if (tail.contains("fake cred layout not supported")) {
+                        failure = "cred layout not supported on this kernel";
+                        break;
+                    }
+                    final long secs = (System.currentTimeMillis() - start) / 1000;
+                    if (secs % 10 == 0) {
+                        final long s = secs;
+                        ui.post(() -> {
+                            if (statusSubtitle != null)
+                                statusSubtitle.setText("Loading KernelSU... " + s + "s");
+                        });
                     }
                 }
+                if (!loaded && failure == null)
+                    failure = "timed out after 120s";
 
-                /* Step 2: verify SELinux is off */
-                String se = service.execRoot("getenforce");
-                addLog("SELinux: " + se.trim());
-
-                /* Step 3: find and run ksud from root shell */
-                addLog("finding ksud...");
-                String ksudPath = service.execRoot(
-                        "PKG=me.weishu.kernelsu; "
-                        + "APK=$(pm path \"$PKG\" 2>/dev/null | head -1 | cut -d: -f2); "
-                        + "KSUD=''; "
-                        + "if [ -n \"$APK\" ]; then "
-                        + "KSUD=\"$(dirname \"$APK\")/lib/arm64/libksud.so\"; fi; "
-                        + "[ -x \"$KSUD\" ] || KSUD=$(find /data/app -path "
-                        + "'*/me.weishu.kernelsu*/lib/arm64/libksud.so' 2>/dev/null | head -1); "
-                        + "[ -x \"$KSUD\" ] || KSUD=/data/local/tmp/ksud; "
-                        + "[ -x \"$KSUD\" ] || KSUD=/data/adb/ksu/bin/ksud; "
-                        + "echo \"$KSUD\"").trim();
-                addLog("ksud=" + ksudPath);
-                if (ksudPath.isEmpty() || ksudPath.contains("not found")) {
-                    addLog("ksud not found - install KernelSU manager app first");
-                    return;
-                }
-
-                addLog("loading KernelSU via root shell...");
-                String ver = service.execRoot(
-                        "\"" + ksudPath + "\" --version 2>&1 | head -1");
-                addLog("ksud version: " + ver.trim());
-                String loadOut = service.execRoot(
-                        "\"" + ksudPath + "\" late-load --allow-shell "
-                        + "--package-name me.weishu.kernelsu 2>&1");
-                addLog("late-load: " + loadOut.trim());
-
-                /* Step 4: check if KSU loaded */
-                Thread.sleep(3000);
-                boolean loaded = false;
-                String modCheck = service.execRoot(
-                        "grep -q '^kernelsu ' /proc/modules && echo KSU_LOADED || echo KSU_MISSING");
-                addLog(modCheck.trim());
-                loaded = modCheck.contains("KSU_LOADED");
-
-                if (loaded) {
-                    service.execRoot("echo 1 > /sys/fs/selinux/enforce 2>/dev/null");
-                    addLog("SELinux re-enforced");
-                    parseInfo(service.info());
-                }
                 final boolean ok = loaded;
-                final String reason = loaded ? null : "ksud late-load did not register module";
+                final String reason = failure;
                 ui.post(() -> {
                     applyDetails();
                     if (ok) {
